@@ -107,19 +107,129 @@ const UploadSelfie = () => {
   }, []);
 
   // Handle file input change
-  const handleSelfieChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleSelfieChange = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
       const file = e.target.files[0];
       try {
-        validateImage(file);
-        setSelfie(file);
-        setPreviewUrl(URL.createObjectURL(file));
+        // Clear previous errors
         setUploadError(null);
+    
+        // Check if file exists
+        if (!file) {
+          throw new Error('No file selected');
+        }
+    
+        // Check file size before processing
+        const maxSize = 20 * 1024 * 1024; // 20MB
+        if (file.size > maxSize) {
+          throw new Error(`File size (${(file.size / (1024 * 1024)).toFixed(2)}MB) exceeds the maximum limit of 20MB`);
+        }
+    
+        // Validate file type with more comprehensive mobile camera formats
+        const validTypes = ['image/jpeg', 'image/png', 'image/jpg'];
+        const fileType = file.type.toLowerCase();
+        if (!validTypes.some(type => fileType.includes(type.split('/')[1]))) {
+          throw new Error(`Invalid file type: ${file.type}. Only JPEG and PNG images are supported`);
+        }
+        
+        // Handle mobile camera orientation
+        if (file instanceof Blob) {
+          const reader = new FileReader();
+          reader.onload = (e) => {
+            if (e.target?.result) {
+              const img = new Image();
+              img.onload = () => {
+                URL.revokeObjectURL(img.src);
+              };
+              img.src = e.target.result as string;
+            }
+          };
+          reader.readAsDataURL(file);
+        }
+    
+        // Compress and handle image orientation
+        const compressAndOrient = async (file: File) => {
+          return new Promise<File>((resolve, reject) => {
+            const img = new Image();
+            img.onload = () => {
+              const canvas = document.createElement('canvas');
+              const ctx = canvas.getContext('2d');
+              if (!ctx) {
+                reject(new Error('Failed to get canvas context'));
+                return;
+              }
+
+              // Set proper dimensions
+              const MAX_WIDTH = 1920;
+              const MAX_HEIGHT = 1920;
+              let width = img.width;
+              let height = img.height;
+
+              if (width > height) {
+                if (width > MAX_WIDTH) {
+                  height *= MAX_WIDTH / width;
+                  width = MAX_WIDTH;
+                }
+              } else {
+                if (height > MAX_HEIGHT) {
+                  width *= MAX_HEIGHT / height;
+                  height = MAX_HEIGHT;
+                }
+              }
+
+              canvas.width = width;
+              canvas.height = height;
+
+              // Draw and compress
+              ctx.drawImage(img, 0, 0, width, height);
+              canvas.toBlob(
+                (blob) => {
+                  if (!blob) {
+                    reject(new Error('Failed to compress image'));
+                    return;
+                  }
+                  const compressedFile = new File([blob], file.name, {
+                    type: 'image/jpeg',
+                    lastModified: Date.now(),
+                  });
+                  resolve(compressedFile);
+                },
+                'image/jpeg',
+                0.8
+              );
+            };
+            img.onerror = () => reject(new Error('Failed to load image'));
+            img.src = URL.createObjectURL(file);
+          });
+        };
+
+        const processedFile = await compressAndOrient(file);
+        validateImage(processedFile);
+        setSelfie(processedFile);
+        
+        // Create and validate preview URL
+        const url = URL.createObjectURL(processedFile);
+        if (!url) {
+          throw new Error('Failed to create preview URL');
+        }
+        setPreviewUrl(url);
+
+        console.log('Selfie file validated successfully:', {
+          name: file.name,
+          type: file.type,
+          size: `${(file.size / (1024 * 1024)).toFixed(2)}MB`
+        });
       } catch (error: any) {
-        setUploadError(error.message);
+        console.error('Error processing selfie:', error);
+        setUploadError(error.message || 'Error processing selfie file');
+        setSelfie(null);
+        if (previewUrl) {
+          URL.revokeObjectURL(previewUrl);
+          setPreviewUrl(null);
+        }
       }
     }
-  }, [validateImage]);
+  }, [validateImage, previewUrl]);
 
   // Compare faces using Promise.all for concurrent processing
   const compareFaces = useCallback(
@@ -132,80 +242,106 @@ const UploadSelfie = () => {
         const selfiePath = `${sharedEventPath}/selfies/${selfieFileName}`;
         const imagesPath = `${sharedEventPath}/images/`;
 
+        console.log('Starting face comparison process:', {
+          eventId,
+          selfiePath,
+          imagesPath
+        });
+
         // List all target images in S3
         const listCommand = new ListObjectsV2Command({
           Bucket: S3_BUCKET_NAME,
           Prefix: imagesPath,
           MaxKeys: 1000
         });
+
+        console.log('Fetching images from S3...');
         const listResponse = await s3Client.send(listCommand);
         if (!listResponse.Contents || listResponse.Contents.length === 0) {
           throw new Error('No images found in this event. Please ensure images are uploaded before attempting face comparison.');
         }
+
         const uploadKeys = listResponse.Contents
           .filter(item => item.Key && /\.(jpg|jpeg|png)$/i.test(item.Key))
           .map(item => item.Key!);
+
         if (uploadKeys.length === 0) {
           throw new Error('No valid images found in this event. Please upload some JPEG or PNG images first.');
         }
 
-        // Process all images concurrently using Promise.all
-        const promises = uploadKeys.map(async (key, index) => {
-          try {
-            console.log(`Processing image ${index + 1}/${uploadKeys.length}: ${key}`);
-            const compareCommand = new CompareFacesCommand({
-              SourceImage: {
-                S3Object: { Bucket: S3_BUCKET_NAME, Name: selfiePath },
-              },
-              TargetImage: {
-                S3Object: { Bucket: S3_BUCKET_NAME, Name: key },
-              },
-              SimilarityThreshold: 80,
-              QualityFilter: "HIGH"
-            });
+        console.log(`Found ${uploadKeys.length} images to process`);
 
-            // Set a timeout for each face comparison
-            const timeoutPromise = new Promise((_, reject) =>
-              setTimeout(() => reject(new Error('Face comparison timed out')), 30000)
-            );
+        // Process images in smaller batches to prevent overwhelming the service
+        const batchSize = 10;
+        const results = [];
 
-            const compareResponse = await Promise.race([
-              rekognitionClient.send(compareCommand),
-              timeoutPromise
-            ]);
+        for (let i = 0; i < uploadKeys.length; i += batchSize) {
+          const batch = uploadKeys.slice(i, i + batchSize);
+          console.log(`Processing batch ${Math.floor(i/batchSize) + 1}/${Math.ceil(uploadKeys.length/batchSize)}`);
 
-            if (compareResponse.FaceMatches && compareResponse.FaceMatches.length > 0) {
-              const bestMatch = compareResponse.FaceMatches.reduce((prev, current) =>
-                (prev.Similarity || 0) > (current.Similarity || 0) ? prev : current
-              );
-              console.log(`Found face match in ${key} with similarity: ${bestMatch.Similarity}%`);
-              return { url: `https://${S3_BUCKET_NAME}.s3.amazonaws.com/${key}`, similarity: bestMatch.Similarity || 0 };
-            } else {
-              console.log(`No face matches found in image: ${key}`);
+          const batchPromises = batch.map(async (key) => {
+            try {
+              const compareCommand = new CompareFacesCommand({
+                SourceImage: {
+                  S3Object: { Bucket: S3_BUCKET_NAME, Name: selfiePath },
+                },
+                TargetImage: {
+                  S3Object: { Bucket: S3_BUCKET_NAME, Name: key },
+                },
+                SimilarityThreshold: 80,
+                QualityFilter: "HIGH"
+              });
+
+              const compareResponse = await Promise.race([
+                rekognitionClient.send(compareCommand),
+                new Promise((_, reject) => 
+                  setTimeout(() => reject(new Error('Face comparison timed out')), 30000)
+                )
+              ]);
+
+              if (compareResponse.FaceMatches && compareResponse.FaceMatches.length > 0) {
+                const bestMatch = compareResponse.FaceMatches.reduce((prev, current) =>
+                  (prev.Similarity || 0) > (current.Similarity || 0) ? prev : current
+                );
+                console.log(`Found match in ${key} with similarity: ${bestMatch.Similarity}%`);
+                return { url: `https://${S3_BUCKET_NAME}.s3.amazonaws.com/${key}`, similarity: bestMatch.Similarity || 0 };
+              }
+              return null;
+            } catch (error) {
+              console.error(`Error processing image ${key}:`, error);
               return null;
             }
-          } catch (error) {
-            console.error(`Error processing image ${key}:`, error);
-            return null;
-          }
-        });
+          });
 
-        const results = await Promise.all(promises);
+          const batchResults = await Promise.all(batchPromises);
+          results.push(...batchResults.filter(result => result !== null));
+
+          // Add a small delay between batches to prevent rate limiting
+          if (i + batchSize < uploadKeys.length) {
+            await new Promise(resolve => setTimeout(resolve, 1000));
+          }
+        }
+
         const matchedResults = results.filter(
           (result): result is { url: string; similarity: number } =>
             result !== null && result.similarity >= 70
         );
+
         const sortedMatches = matchedResults.sort((a, b) => b.similarity - a.similarity);
+
         if (sortedMatches.length === 0) {
           throw new Error('No matching faces found in your uploaded images.');
         }
+
+        console.log(`Face comparison completed. Found ${sortedMatches.length} matches`);
+
         return {
           matchedUrls: sortedMatches.map(match => match.url),
           message: `Found ${sortedMatches.length} matches out of ${uploadKeys.length} images processed.`
         };
       } catch (error: any) {
         console.error('Error in face comparison process:', error);
-        throw error;
+        throw new Error(`Face comparison failed: ${error.message}. Please try again.`);
       }
     },
     [selectedEvent, getSharedEventPath]
@@ -256,9 +392,19 @@ const UploadSelfie = () => {
   const uploadToS3 = useCallback(async (file: File, fileName: string) => {
     try {
       if (!selectedEvent) throw new Error('Event ID is required for uploading a selfie.');
+      if (!file) throw new Error('No file selected for upload.');
+      
       const isSharedLink = !localStorage.getItem('userEmail');
       const sessionId = localStorage.getItem('sessionId');
       const folderPath = `${getSharedEventPath(selectedEvent)}/selfies/${fileName}`;
+      
+      console.log('Starting upload to S3:', {
+        fileName,
+        fileSize: file.size,
+        fileType: file.type,
+        folderPath
+      });
+
       const uploadParams = {
         Bucket: S3_BUCKET_NAME,
         Key: folderPath,
@@ -276,13 +422,23 @@ const UploadSelfie = () => {
         params: uploadParams,
         partSize: 5 * 1024 * 1024,
         leavePartsOnError: false,
+        queueSize: 4
+      });
+
+      uploadInstance.on('httpUploadProgress', (progress) => {
+        console.log('Upload progress:', {
+          loaded: progress.loaded,
+          total: progress.total
+        });
       });
 
       await uploadInstance.done();
+      console.log('Upload completed successfully');
       return fileName;
-    } catch (error) {
-      console.error(`Error uploading to path ${selectedEvent}:`, error);
-      throw new Error('Failed to upload selfie. Please try again.');
+    } catch (error: any) {
+      console.error('Error uploading to S3:', error);
+      const errorMessage = error.message || 'Unknown error occurred during upload';
+      throw new Error(`Failed to upload selfie: ${errorMessage}. Please try again.`);
     }
   }, [selectedEvent, getSharedEventPath]);
 
@@ -397,17 +553,17 @@ const UploadSelfie = () => {
                   <div className="flex flex-col items-center">
                     <Camera className="w-8 h-8 text-black-400" />
                     <p className="mt-2 text-sm text-blue-500">
-                      <span className="font-semibold">Click to upload or drag and drop</span>
+                      <span className="font-semibold">Take a selfie with your camera</span>
                     </p>
-                    <p className="text-xs text-blue-500 mt-1">Take a clear selfie for best results</p>
-                    <p className="text-xs text-blue-500 mt-1">JPEG or PNG up to 10MB</p>
+                    <p className="text-xs text-blue-500 mt-1">Position yourself clearly for best results</p>
                   </div>
                   <input
                     id="selfie-upload"
                     type="file"
                     className="hidden"
                     onChange={handleSelfieChange}
-                    accept="image/jpeg,image/png"
+                    accept="image/*;capture=user"
+                    capture
                   />
                 </label>
               </div>
